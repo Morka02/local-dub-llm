@@ -55,6 +55,7 @@ jobs:
         env:
           DUB_BASE_URL: ${{ secrets.DUB_BASE_URL }}
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
+          YT_COOKIES_B64: ${{ secrets.YT_COOKIES_B64 }}
         run: |
           mkdir -p output
           URL="${{ github.event.inputs.video_url }}"
@@ -62,7 +63,22 @@ jobs:
           if [ "${{ github.event.inputs.turbo }}" = "true" ]; then FLAGS="--turbo"; fi
           LIM="${{ github.event.inputs.limit }}"; [ -z "$LIM" ] && LIM=0
           COOK=""
-          if [ -n "$YT_COOKIES" ]; then printf '%s' "$YT_COOKIES" > cookies.txt; COOK="--cookies cookies.txt"; fi
+          # Cookies: prefer the paste-safe base64 secret (tabs survive); fall back to raw.
+          if [ -n "$YT_COOKIES_B64" ]; then
+            echo "$YT_COOKIES_B64" | base64 -d > cookies.txt
+            COOK="--cookies cookies.txt"
+          elif [ -n "$YT_COOKIES" ]; then
+            printf '%s' "$YT_COOKIES" > cookies.txt
+            COOK="--cookies cookies.txt"
+          fi
+          # Sanity-check the cookies file is valid Netscape format before using it.
+          if [ -n "$COOK" ]; then
+            if head -n1 cookies.txt | grep -qi "netscape"; then
+              echo "Cookies: valid Netscape header detected ($(wc -l < cookies.txt) lines)."
+            else
+              echo "WARNING: cookies.txt missing Netscape header - download may fail."
+            fi
+          fi
           if echo "$URL" | grep -qi "drive.google"; then
             # Google Drive single file -> download then dub directly
             gdown --fuzzy "$URL" -O input.mp4
