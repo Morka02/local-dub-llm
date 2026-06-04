@@ -1,0 +1,135 @@
+name: Dub from Drive (auto-pickup)
+
+# You drop a video into your Google Drive "DubInbox" folder, then press Run.
+# This grabs the newest unprocessed video, dubs it (Hindi -> English, turbo,
+# watermark-free), writes the result to "DubDone", and moves the original into
+# "DubInbox/archive" so it is never dubbed twice.
+#
+# Requires one secret: RCLONE_CONF  (your rclone Google Drive config text).
+# Optional secrets: DUB_BASE_URL, YT_COOKIES_B64 (not needed for this flow).
+
+on:
+  workflow_dispatch:
+    inputs:
+      src:
+        description: "Source language"
+        default: "Hindi"
+        required: true
+      target:
+        description: "Target language"
+        default: "English"
+        required: true
+      genre:
+        description: "Genre (monologue, podcast, ott_movie_sequence, advertisement, edtech, academic_lecture_formal)"
+        default: "monologue"
+        required: true
+      speakers:
+        description: "Number of speakers"
+        default: "1"
+        required: true
+      turbo:
+        description: "Turbo mode (fast, all pieces in parallel)"
+        type: boolean
+        default: true
+      inbox:
+        description: "Drive inbox folder name"
+        default: "DubInbox"
+        required: true
+      outbox:
+        description: "Drive output folder name"
+        default: "DubDone"
+        required: true
+
+jobs:
+  dub:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ffmpeg + rclone + helpers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          pip install requests
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Connect Google Drive
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          if [ -z "$RCLONE_CONF" ]; then
+            echo "::error::RCLONE_CONF secret is not set. Add it (rclone Drive config) before running."
+            exit 1
+          fi
+          mkdir -p ~/.config/rclone
+          printf '%s' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          echo "rclone configured."
+
+      - name: Pull newest video from Drive inbox
+        id: pull
+        env:
+          INBOX: ${{ github.event.inputs.inbox }}
+        run: |
+          mkdir -p input output
+          REMOTE="gdrive:${INBOX}"
+          echo "Scanning $REMOTE for videos (newest first)..."
+          # List files, pick the newest video via helper script (parse-safe).
+          NEWEST=$(rclone lsjson "$REMOTE" --files-only 2>/dev/null | python3 pick_newest.py)
+          if [ -z "$NEWEST" ]; then
+            echo "::warning::No video found in $REMOTE. Drop a file there and run again."
+            echo "found=no" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Newest video: $NEWEST"
+          rclone copy "$REMOTE/$NEWEST" input/ -v --drive-chunk-size 64M
+          echo "found=yes" >> "$GITHUB_OUTPUT"
+          # Save the exact name for later steps (archive + output naming).
+          printf '%s' "$NEWEST" > .picked_name
+          echo "name<<EOF" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$NEWEST" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Dub the video
+        if: steps.pull.outputs.found == 'yes'
+        env:
+          DUB_BASE_URL: ${{ secrets.DUB_BASE_URL }}
+        run: |
+          FLAGS=""
+          if [ "${{ github.event.inputs.turbo }}" = "true" ]; then FLAGS="--turbo"; fi
+          IN=$(ls input/ | head -n1)
+          echo "Dubbing: input/$IN"
+          python dub_video.py "$GITHUB_WORKSPACE/input/$IN" \
+            --src "${{ github.event.inputs.src }}" --target "${{ github.event.inputs.target }}" \
+            --genre "${{ github.event.inputs.genre }}" --speakers "${{ github.event.inputs.speakers }}" \
+            --dir "$GITHUB_WORKSPACE/output" $FLAGS
+
+      - name: Upload result to Drive outbox + archive original
+        if: steps.pull.outputs.found == 'yes' && success()
+        env:
+          INBOX: ${{ github.event.inputs.inbox }}
+          OUTBOX: ${{ github.event.inputs.outbox }}
+        run: |
+          NAME=$(cat .picked_name)
+          echo "Uploading dubbed result to gdrive:${OUTBOX} ..."
+          rclone copy output/ "gdrive:${OUTBOX}" --transfers 1 --drive-chunk-size 64M -v
+          echo "Archiving original '$NAME' to gdrive:${INBOX}/archive ..."
+          rclone moveto "gdrive:${INBOX}/$NAME" "gdrive:${INBOX}/archive/$NAME" -v || \
+            echo "::warning::Could not archive original (it may have been moved already)."
+          echo "Done. Dubbed file is in your Drive '${OUTBOX}' folder."
+
+      - name: Backup copy in Artifacts (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dubbed-video
+          path: output/**
+          retention-days: 30
+          if-no-files-found: warn
