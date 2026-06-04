@@ -1,9 +1,11 @@
 name: Dub from Drive (auto-pickup)
 
 # You drop a video into your Google Drive "DubInbox" folder, then press Run.
-# This grabs the newest unprocessed video, dubs it (Hindi -> English, turbo,
-# watermark-free), writes the result to "DubDone", and moves the original into
-# "DubInbox/archive" so it is never dubbed twice.
+# This grabs the newest unprocessed video, dubs it (Hindi -> English, clean
+# normal mode, watermark-free), writes the result to "DubDone", and moves the
+# original into "DubInbox/archive" so it is never dubbed twice.
+# Chunks are ~60s by default: whole sentences per piece (no choppy 10s cuts),
+# and all pieces still dub in parallel so it stays fast.
 #
 # Requires one secret: RCLONE_CONF  (your rclone Google Drive config text).
 # Optional secrets: DUB_BASE_URL, YT_COOKIES_B64 (not needed for this flow).
@@ -27,10 +29,10 @@ on:
         description: "Number of speakers"
         default: "1"
         required: true
-      turbo:
-        description: "Turbo mode (fast, all pieces in parallel)"
-        type: boolean
-        default: true
+      chunk:
+        description: "Seconds per chunk. 60 = clean + a bit fast (default). Bigger = cleaner/slower, smaller = faster/choppier."
+        default: "60"
+        required: false
       inbox:
         description: "Drive inbox folder name"
         default: "DubInbox"
@@ -102,10 +104,12 @@ jobs:
         env:
           DUB_BASE_URL: ${{ secrets.DUB_BASE_URL }}
         run: |
+          # Normal mode only (no turbo). Chunk size controls speed vs cleanliness.
+          CHUNK="${{ github.event.inputs.chunk }}"; [ -z "$CHUNK" ] && CHUNK=60
           FLAGS=""
-          if [ "${{ github.event.inputs.turbo }}" = "true" ]; then FLAGS="--turbo"; fi
+          if [ "$CHUNK" -gt 0 ] 2>/dev/null; then FLAGS="--chunk $CHUNK"; fi
           IN=$(ls input/ | head -n1)
-          echo "Dubbing: input/$IN"
+          echo "Dubbing: input/$IN  (chunk=${CHUNK}s, normal clean mode)"
           python dub_video.py "$GITHUB_WORKSPACE/input/$IN" \
             --src "${{ github.event.inputs.src }}" --target "${{ github.event.inputs.target }}" \
             --genre "${{ github.event.inputs.genre }}" --speakers "${{ github.event.inputs.speakers }}" \
