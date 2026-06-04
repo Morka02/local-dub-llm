@@ -1,0 +1,8 @@
+cookies.txt
+_dl/
+_inbox/
+_out/
+output/
+work_*/
+__pycache__/
+*.pyc
