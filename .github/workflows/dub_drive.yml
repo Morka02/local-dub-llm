@@ -33,6 +33,14 @@ on:
         description: "Seconds per chunk. 60 = clean + a bit fast (default). Bigger = cleaner/slower, smaller = faster/choppier."
         default: "60"
         required: false
+      workers:
+        description: "Max chunks dubbing at once. 8 = reliable for long videos (no overload). Higher = faster but risks failures."
+        default: "8"
+        required: false
+      tries:
+        description: "Retries per chunk before giving up. Higher = fewer failures."
+        default: "10"
+        required: false
       inbox:
         description: "Drive inbox folder name"
         default: "DubInbox"
@@ -104,16 +112,59 @@ jobs:
         env:
           DUB_BASE_URL: ${{ secrets.DUB_BASE_URL }}
         run: |
-          # Normal mode only (no turbo). Chunk size controls speed vs cleanliness.
+          # Normal mode only (no turbo). Chunk size controls clean-ness; workers
+          # caps how many dub at once so the engine is never overloaded (the
+          # cause of failed chunks on long videos).
           CHUNK="${{ github.event.inputs.chunk }}"; [ -z "$CHUNK" ] && CHUNK=60
+          WORKERS="${{ github.event.inputs.workers }}"; [ -z "$WORKERS" ] && WORKERS=8
+          TRIES="${{ github.event.inputs.tries }}"; [ -z "$TRIES" ] && TRIES=10
           FLAGS=""
           if [ "$CHUNK" -gt 0 ] 2>/dev/null; then FLAGS="--chunk $CHUNK"; fi
+          if [ "$WORKERS" -gt 0 ] 2>/dev/null; then FLAGS="$FLAGS --workers $WORKERS"; fi
+          if [ "$TRIES" -gt 0 ] 2>/dev/null; then FLAGS="$FLAGS --tries $TRIES"; fi
           IN=$(ls input/ | head -n1)
-          echo "Dubbing: input/$IN  (chunk=${CHUNK}s, normal clean mode)"
-          python dub_video.py "$GITHUB_WORKSPACE/input/$IN" \
-            --src "${{ github.event.inputs.src }}" --target "${{ github.event.inputs.target }}" \
-            --genre "${{ github.event.inputs.genre }}" --speakers "${{ github.event.inputs.speakers }}" \
-            --dir "$GITHUB_WORKSPACE/output" $FLAGS
+          echo "Dubbing: input/$IN  (chunk=${CHUNK}s, workers=${WORKERS}, tries=${TRIES})"
+
+          COMMON="--src ${{ github.event.inputs.src }} --target ${{ github.event.inputs.target }} \
+            --genre ${{ github.event.inputs.genre }} --speakers ${{ github.event.inputs.speakers }} \
+            --dir $GITHUB_WORKSPACE/output $FLAGS"
+
+          # Pass 1: full run from the video file. Creates work_*/chunks with the
+          # finished dub_*.mp4 cached on disk.
+          python dub_video.py "$GITHUB_WORKSPACE/input/$IN" $COMMON || true
+
+          # Retry loop: keep re-running on the chunk folder until ZERO chunks are
+          # missing. Finished chunks are cached and skipped, so each pass only
+          # redoes the failures. We never give up while progress is still possible.
+          WORKDIR=$(ls -d "$GITHUB_WORKSPACE"/work_* 2>/dev/null | head -n1)
+          if [ -n "$WORKDIR" ] && [ -d "$WORKDIR/chunks" ]; then
+            MAX_PASSES=40
+            PASS=0
+            while :; do
+              TOTAL=$(ls "$WORKDIR/chunks"/part_*.mp4 2>/dev/null | wc -l)
+              DONE=$(ls "$WORKDIR/chunks"/dub_*.mp4 2>/dev/null | wc -l)
+              MISSING=$(( TOTAL - DONE ))
+              echo "::notice::Retry check - $DONE/$TOTAL chunks done, $MISSING missing (pass $PASS)."
+              if [ "$MISSING" -le 0 ]; then echo "All chunks complete."; break; fi
+              PASS=$(( PASS + 1 ))
+              if [ "$PASS" -gt "$MAX_PASSES" ]; then
+                echo "::warning::Reached $MAX_PASSES retry passes with $MISSING still missing; rebuilding with what we have."
+                break
+              fi
+              echo "=== Retry pass $PASS: re-dubbing $MISSING missing chunk(s) ==="
+              PREV=$DONE
+              python dub_video.py "$WORKDIR/chunks" $COMMON || true
+              # If a whole pass made zero new progress, wait then continue (the
+              # engine/service may be briefly rate-limited). Don't stop.
+              NOWDONE=$(ls "$WORKDIR/chunks"/dub_*.mp4 2>/dev/null | wc -l)
+              if [ "$NOWDONE" -le "$PREV" ]; then
+                echo "No new chunks this pass; cooling down 30s before retrying..."
+                sleep 30
+              fi
+            done
+            # Final rebuild from the (now complete) chunk folder to produce the mux.
+            python dub_video.py "$WORKDIR/chunks" $COMMON || true
+          fi
 
       - name: Upload result to Drive outbox + archive original
         if: steps.pull.outputs.found == 'yes' && success()
