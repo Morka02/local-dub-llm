@@ -10,3 +10,13 @@ __pycache__/
 *.pyc
 
 restore_rclone.bat
+dub.bat
+fetch_and_dub.py
+localdub.env
+localdub.service
+setup.sh
+worker.py
+SETUP_VM.md
+DEPLOY_GITHUB.md
+COLAB_AGENT_CELL.py
+musetalk/
