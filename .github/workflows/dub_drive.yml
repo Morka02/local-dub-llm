@@ -38,8 +38,8 @@ on:
         default: "8"
         required: false
       tries:
-        description: "Retries per chunk before giving up. Higher = fewer failures."
-        default: "10"
+        description: "Retries per chunk before giving up. After this, the video ships with gaps + failed chunks saved for a manual re-run."
+        default: "5"
         required: false
       inbox:
         description: "Drive inbox folder name"
@@ -117,7 +117,7 @@ jobs:
           # cause of failed chunks on long videos).
           CHUNK="${{ github.event.inputs.chunk }}"; [ -z "$CHUNK" ] && CHUNK=60
           WORKERS="${{ github.event.inputs.workers }}"; [ -z "$WORKERS" ] && WORKERS=8
-          TRIES="${{ github.event.inputs.tries }}"; [ -z "$TRIES" ] && TRIES=10
+          TRIES="${{ github.event.inputs.tries }}"; [ -z "$TRIES" ] && TRIES=5
           FLAGS=""
           if [ "$CHUNK" -gt 0 ] 2>/dev/null; then FLAGS="--chunk $CHUNK"; fi
           if [ "$WORKERS" -gt 0 ] 2>/dev/null; then FLAGS="$FLAGS --workers $WORKERS"; fi
@@ -138,7 +138,7 @@ jobs:
           # redoes the failures. We never give up while progress is still possible.
           WORKDIR=$(ls -d "$GITHUB_WORKSPACE"/work_* 2>/dev/null | head -n1)
           if [ -n "$WORKDIR" ] && [ -d "$WORKDIR/chunks" ]; then
-            MAX_PASSES=40
+            MAX_PASSES=5
             PASS=0
             while :; do
               TOTAL=$(ls "$WORKDIR/chunks"/part_*.mp4 2>/dev/null | wc -l)
@@ -162,8 +162,39 @@ jobs:
                 sleep 30
               fi
             done
-            # Final rebuild from the (now complete) chunk folder to produce the mux.
+            # Final rebuild from the chunk folder to produce the mux (with gaps
+            # where any chunks are still missing after 5 passes).
             python dub_video.py "$WORKDIR/chunks" $COMMON || true
+
+            # Collect chunks that still failed (part_NNN with no dub_NNN) so they
+            # ship to DubDone next to the video. You re-dub just these next run.
+            STEM="${IN%.*}"
+            FAILDIR="$GITHUB_WORKSPACE/output/${STEM}_FAILED_CHUNKS"
+            FAILED_LIST=""
+            for p in "$WORKDIR/chunks"/part_*.mp4; do
+              [ -e "$p" ] || continue
+              base=$(basename "$p")           # part_007.mp4
+              num="${base#part_}"; num="${num%.mp4}"   # 007
+              if [ ! -e "$WORKDIR/chunks/dub_${num}.mp4" ]; then
+                mkdir -p "$FAILDIR"
+                cp "$p" "$FAILDIR/$base"
+                FAILED_LIST="$FAILED_LIST $num"
+              fi
+            done
+            if [ -n "$FAILED_LIST" ]; then
+              # A note file so you know which spans are silent and how to fix.
+              {
+                echo "These chunks failed after $TRIES tries and are SILENT in the video."
+                echo "Failed chunk numbers:$FAILED_LIST"
+                echo ""
+                echo "To fix: put this whole *_FAILED_CHUNKS folder back into your"
+                echo "DubInbox as a folder, and run the workflow pointed at it - it"
+                echo "will dub only these and you can splice them in."
+              } > "$FAILDIR/README_FAILED.txt"
+              echo "::warning::Failed chunks saved to ${STEM}_FAILED_CHUNKS:$FAILED_LIST"
+            else
+              echo "No failed chunks - clean dub."
+            fi
           fi
 
       - name: Upload result to Drive outbox + archive original
